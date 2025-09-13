@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "java-analyzer": {
+      "type": "stdio",
+      "command": "/Users/mwgreen/git-repos/java-mcp-server/eclipse-jdt-mcp"
+    }
+  }
+}

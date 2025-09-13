@@ -12,7 +12,7 @@ const JAR_PATH = path.join(__dirname, 'target', 'java-mcp-server-1.0.0.jar');
 
 let javaProcess = null;
 let javaReady = false;
-let initializeRequest = null;
+let initializeId = null;  // Track the initialize request ID
 let requestBuffer = '';
 let pendingRequests = [];
 
@@ -48,14 +48,19 @@ function startJavaBackend() {
       if (line.trim()) {
         try {
           const response = JSON.parse(line);
-          console.log(JSON.stringify(response));
           
-          // If this was the initialization response, mark Java as ready
-          if (response.result && initializeRequest) {
+          // Check if this is an initialization response from Java
+          if (response.result && response.result.serverInfo && response.id === initializeId) {
+            // Java has initialized, mark as ready
             javaReady = true;
-            initializeRequest = null;
+            initializeId = null;
             processPendingRequests();
+            // Don't forward this duplicate initialize response (we already sent one)
+            return;
           }
+          
+          // Forward all other responses
+          console.log(JSON.stringify(response));
         } catch (e) {
           console.error(`[eclipse-jdt-mcp] Failed to parse Java response: ${e.message}`);
         }
@@ -117,30 +122,62 @@ rl.on('line', (line) => {
     
     // Handle initialize specially
     if (request.method === 'initialize') {
-      // Always respond immediately to Claude Code
-      const response = {
-        result: {
-          protocolVersion: request.params?.protocolVersion || "2024-11-05",
-          capabilities: { tools: {} },
-          serverInfo: { 
-            name: "Eclipse JDT Java Analyzer", 
-            version: "1.0.0"
-          }
-        },
-        jsonrpc: "2.0",
-        id: request.id
-      };
-      console.log(JSON.stringify(response));
-      
-      // Start Java backend if not already running
+      // Start Java backend first if not already running
       if (!javaProcess) {
         startJavaBackend();
-      }
-      
-      // Forward to Java for actual initialization
-      if (javaProcess && javaProcess.stdin.writable) {
-        initializeRequest = line;
-        javaProcess.stdin.write(line + '\n');
+        
+        // For the very first initialize, respond immediately but note we have tools
+        const response = {
+          result: {
+            protocolVersion: request.params?.protocolVersion || "2024-11-05",
+            capabilities: {
+              tools: {
+                listChanged: false  // We don't support dynamic tool list changes
+              }
+            },
+            serverInfo: {
+              name: "Eclipse JDT Java Analyzer",
+              version: "1.0.0"
+            }
+          },
+          jsonrpc: "2.0",
+          id: request.id
+        };
+        console.log(JSON.stringify(response));
+        
+        // Still forward to Java for proper initialization
+        initializeId = request.id;
+        // Send immediately to Java (it needs this to become ready)
+        // Java process was just started, give it a moment to be ready for stdin
+        setTimeout(() => {
+          if (javaProcess && javaProcess.stdin.writable) {
+            javaProcess.stdin.write(line + '\n');
+          }
+        }, 100);
+      } else if (javaReady) {
+        // Java already running and ready, respond immediately
+        const response = {
+          result: {
+            protocolVersion: request.params?.protocolVersion || "2024-11-05",
+            capabilities: {
+              tools: {
+                listChanged: false  // We don't support dynamic tool list changes
+              }
+            },
+            serverInfo: {
+              name: "Eclipse JDT Java Analyzer",
+              version: "1.0.0"
+            }
+          },
+          jsonrpc: "2.0",
+          id: request.id
+        };
+        console.log(JSON.stringify(response));
+        
+        // Don't forward to Java - we've already responded
+      } else {
+        // Java running but not ready yet, queue the request
+        pendingRequests.push(line);
       }
       return;
     }
@@ -148,10 +185,29 @@ rl.on('line', (line) => {
     // Handle notifications
     if (request.method === 'notifications/initialized') {
       // Forward to Java if ready
-      if (javaProcess && javaProcess.stdin.writable) {
+      if (javaReady && javaProcess && javaProcess.stdin.writable) {
         javaProcess.stdin.write(line + '\n');
       }
+      // If Java not ready yet, ignore (we'll handle it when Java is ready)
       return; // No response needed
+    }
+    
+    // Handle tools/list request - must be forwarded to Java
+    if (request.method === 'tools/list') {
+      
+      // Ensure Java is started
+      if (!javaProcess) {
+        startJavaBackend();
+      }
+      
+      // Forward to Java or queue
+      if (javaReady && javaProcess && javaProcess.stdin.writable) {
+        javaProcess.stdin.write(line + '\n');
+      } else {
+        // Java starting, queue the request
+        pendingRequests.push(line);
+      }
+      return;
     }
     
     // For other requests, forward to Java or queue
@@ -171,21 +227,6 @@ rl.on('line', (line) => {
     } else {
       // Java starting, queue the request
       pendingRequests.push(line);
-      
-      // Provide a temporary response for tools/list
-      if (request.method === 'tools/list') {
-        const response = {
-          result: {
-            tools: [{
-              name: "initialize_project",
-              description: "Initialize Java project analysis (backend starting...)"
-            }]
-          },
-          jsonrpc: "2.0",
-          id: request.id
-        };
-        console.log(JSON.stringify(response));
-      }
     }
   } catch (e) {
     console.error(`[eclipse-jdt-mcp] Failed to parse request: ${e.message}`);

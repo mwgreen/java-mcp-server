@@ -6,9 +6,11 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import org.eclipse.core.runtime.CoreException;
 import org.eclipse.core.runtime.Platform;
-import org.eclipse.core.resources.ResourcesPlugin;
-import org.eclipse.core.resources.IWorkspace;
 import org.eclipse.core.runtime.adaptor.EclipseStarter;
+import org.eclipse.core.resources.ResourcesPlugin;
+import org.osgi.framework.BundleContext;
+import org.eclipse.core.resources.IWorkspace;
+import org.eclipse.core.resources.IWorkspaceRoot;
 import org.eclipse.jdt.core.JavaCore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -44,16 +46,38 @@ public class JavaMCPServer {
         server.run();
     }
     
+    private static boolean eclipseWorkspaceInitialized = false;
+    
+    public static synchronized void ensureEclipseWorkspace() {
+        if (!eclipseWorkspaceInitialized) {
+            initializeEclipseWorkspace();
+            eclipseWorkspaceInitialized = true;
+        }
+    }
+    
     private static void initializeEclipseWorkspace() {
-        // Lazy initialization - called when needed
+        // Initialize Eclipse workspace for headless operation
         try {
-            // Create workspace directory for when Eclipse APIs need it
+            // Create workspace directory
             Path workspaceDir = createTemporaryWorkspace();
+            
+            // Set system properties for headless Eclipse
             System.setProperty("osgi.instance.area", workspaceDir.toUri().toString());
+            System.setProperty("osgi.configuration.area", workspaceDir.resolve("configuration").toUri().toString());
+            System.setProperty("eclipse.application", "org.eclipse.jdt.apt.core.aptBuild");
             System.setProperty("eclipse.ignoreApp", "true");
+            System.setProperty("osgi.noShutdown", "true");
+            System.setProperty("eclipse.application.launchDefault", "false");
+            
+            logger.info("Set up Eclipse headless workspace at: {}", workspaceDir);
+            
+            // Note: Full OSGi runtime requires Eclipse installation
+            // For now, we'll work with limited JDT functionality
+            logger.info("Running with limited Eclipse JDT functionality (no full OSGi runtime)");
+            
         } catch (Exception e) {
             logger.error("Failed to set up Eclipse environment: {}", e.getMessage());
-            throw new RuntimeException("Failed to set up Eclipse environment: " + e.getMessage(), e);
+            // Don't throw - continue with basic mode
         }
     }
     
@@ -198,9 +222,13 @@ public class JavaMCPServer {
         }
         
         ObjectNode capabilities = objectMapper.createObjectNode();
-        capabilities.put("tools", true);
-        
-        // Add roots capability that Claude Code expects
+
+        // Tools capability with proper structure
+        ObjectNode tools = objectMapper.createObjectNode();
+        tools.put("listChanged", false);  // We don't support dynamic tool list changes
+        capabilities.set("tools", tools);
+
+        // Add roots capability (empty object indicates support)
         ObjectNode roots = objectMapper.createObjectNode();
         capabilities.set("roots", roots);
         
@@ -252,12 +280,10 @@ public class JavaMCPServer {
         initProjectTool.put("name", "initialize_project");
         initProjectTool.put("description", "Initialize Java project analysis for a given directory path");
         ObjectNode initParams = objectMapper.createObjectNode();
-        ObjectNode projectPathParam = objectMapper.createObjectNode();
-        projectPathParam.put("type", "string");
-        projectPathParam.put("description", "Absolute path to the Java project directory");
-        projectPathParam.put("required", true);
-        initParams.set("project_path", projectPathParam);
-        initProjectTool.set("inputSchema", createInputSchema(initParams));
+        initParams.set("project_path", createStringParam("Absolute path to the Java project directory"));
+        ArrayNode initRequired = objectMapper.createArrayNode();
+        initRequired.add("project_path");
+        initProjectTool.set("inputSchema", createInputSchema(initParams, initRequired));
         tools.add(initProjectTool);
         
         // Get Call Hierarchy tool
@@ -265,12 +291,15 @@ public class JavaMCPServer {
         callHierarchyTool.put("name", "get_call_hierarchy");
         callHierarchyTool.put("description", "Get method call hierarchy (callers and callees)");
         ObjectNode callHierarchyParams = objectMapper.createObjectNode();
-        callHierarchyParams.set("class_name", createStringParam("Fully qualified class name", true));
-        callHierarchyParams.set("method_name", createStringParam("Method name", true));
-        callHierarchyParams.set("parameter_types", createArrayParam("Method parameter types", false));
-        callHierarchyParams.set("include_callers", createBooleanParam("Include callers in result", false));
-        callHierarchyParams.set("include_callees", createBooleanParam("Include callees in result", false));
-        callHierarchyTool.set("inputSchema", createInputSchema(callHierarchyParams));
+        callHierarchyParams.set("class_name", createStringParam("Fully qualified class name"));
+        callHierarchyParams.set("method_name", createStringParam("Method name"));
+        callHierarchyParams.set("parameter_types", createArrayParam("Method parameter types"));
+        callHierarchyParams.set("include_callers", createBooleanParam("Include callers in result"));
+        callHierarchyParams.set("include_callees", createBooleanParam("Include callees in result"));
+        ArrayNode callRequired = objectMapper.createArrayNode();
+        callRequired.add("class_name");
+        callRequired.add("method_name");
+        callHierarchyTool.set("inputSchema", createInputSchema(callHierarchyParams, callRequired));
         tools.add(callHierarchyTool);
         
         // Get Type Hierarchy tool
@@ -278,8 +307,10 @@ public class JavaMCPServer {
         typeHierarchyTool.put("name", "get_type_hierarchy");
         typeHierarchyTool.put("description", "Get class inheritance hierarchy");
         ObjectNode typeHierarchyParams = objectMapper.createObjectNode();
-        typeHierarchyParams.set("type_name", createStringParam("Fully qualified type name", true));
-        typeHierarchyTool.set("inputSchema", createInputSchema(typeHierarchyParams));
+        typeHierarchyParams.set("type_name", createStringParam("Fully qualified type name"));
+        ArrayNode typeRequired = objectMapper.createArrayNode();
+        typeRequired.add("type_name");
+        typeHierarchyTool.set("inputSchema", createInputSchema(typeHierarchyParams, typeRequired));
         tools.add(typeHierarchyTool);
         
         // Find References tool
@@ -287,11 +318,13 @@ public class JavaMCPServer {
         findRefsTool.put("name", "find_references");
         findRefsTool.put("description", "Find all references to symbols");
         ObjectNode findRefsParams = objectMapper.createObjectNode();
-        findRefsParams.set("class_name", createStringParam("Fully qualified class name", true));
-        findRefsParams.set("member_name", createStringParam("Member name (method/field)", false));
-        findRefsParams.set("parameter_types", createArrayParam("Method parameter types", false));
-        findRefsParams.set("element_type", createStringParam("Element type (method/field/type/constructor)", false));
-        findRefsTool.set("inputSchema", createInputSchema(findRefsParams));
+        findRefsParams.set("class_name", createStringParam("Fully qualified class name"));
+        findRefsParams.set("member_name", createStringParam("Member name (method/field)"));
+        findRefsParams.set("parameter_types", createArrayParam("Method parameter types"));
+        findRefsParams.set("element_type", createStringParam("Element type (method/field/type/constructor)"));
+        ArrayNode findRefsRequired = objectMapper.createArrayNode();
+        findRefsRequired.add("class_name");
+        findRefsTool.set("inputSchema", createInputSchema(findRefsParams, findRefsRequired));
         tools.add(findRefsTool);
         
         // Get Class Info tool
@@ -299,15 +332,17 @@ public class JavaMCPServer {
         classInfoTool.put("name", "get_class_info");
         classInfoTool.put("description", "Get detailed information about a class");
         ObjectNode classInfoParams = objectMapper.createObjectNode();
-        classInfoParams.set("class_name", createStringParam("Fully qualified class name", true));
-        classInfoTool.set("inputSchema", createInputSchema(classInfoParams));
+        classInfoParams.set("class_name", createStringParam("Fully qualified class name"));
+        ArrayNode classInfoRequired = objectMapper.createArrayNode();
+        classInfoRequired.add("class_name");
+        classInfoTool.set("inputSchema", createInputSchema(classInfoParams, classInfoRequired));
         tools.add(classInfoTool);
         
         // List Classes tool
         ObjectNode listClassesTool = objectMapper.createObjectNode();
         listClassesTool.put("name", "list_classes");
         listClassesTool.put("description", "List all classes in the project");
-        listClassesTool.set("inputSchema", createInputSchema(objectMapper.createObjectNode()));
+        listClassesTool.set("inputSchema", createInputSchema(objectMapper.createObjectNode(), objectMapper.createArrayNode()));
         tools.add(listClassesTool);
         
         // Get Method Info tool
@@ -315,10 +350,13 @@ public class JavaMCPServer {
         methodInfoTool.put("name", "get_method_info");
         methodInfoTool.put("description", "Get detailed information about a method");
         ObjectNode methodInfoParams = objectMapper.createObjectNode();
-        methodInfoParams.set("class_name", createStringParam("Fully qualified class name", true));
-        methodInfoParams.set("method_name", createStringParam("Method name", true));
-        methodInfoParams.set("parameter_types", createArrayParam("Method parameter types", false));
-        methodInfoTool.set("inputSchema", createInputSchema(methodInfoParams));
+        methodInfoParams.set("class_name", createStringParam("Fully qualified class name"));
+        methodInfoParams.set("method_name", createStringParam("Method name"));
+        methodInfoParams.set("parameter_types", createArrayParam("Method parameter types"));
+        ArrayNode methodInfoRequired = objectMapper.createArrayNode();
+        methodInfoRequired.add("class_name");
+        methodInfoRequired.add("method_name");
+        methodInfoTool.set("inputSchema", createInputSchema(methodInfoParams, methodInfoRequired));
         tools.add(methodInfoTool);
         
         // Refactor Rename tool
@@ -326,13 +364,17 @@ public class JavaMCPServer {
         renameTool.put("name", "refactor_rename");
         renameTool.put("description", "Rename symbols across the project");
         ObjectNode renameParams = objectMapper.createObjectNode();
-        renameParams.set("element_type", createStringParam("Element type (class/method/field)", true));
-        renameParams.set("class_name", createStringParam("Fully qualified class name", true));
-        renameParams.set("member_name", createStringParam("Member name (for methods/fields)", false));
-        renameParams.set("parameter_types", createArrayParam("Method parameter types", false));
-        renameParams.set("new_name", createStringParam("New name", true));
-        renameParams.set("preview", createBooleanParam("Preview changes only", false));
-        renameTool.set("inputSchema", createInputSchema(renameParams));
+        renameParams.set("element_type", createStringParam("Element type (class/method/field)"));
+        renameParams.set("class_name", createStringParam("Fully qualified class name"));
+        renameParams.set("member_name", createStringParam("Member name (for methods/fields)"));
+        renameParams.set("parameter_types", createArrayParam("Method parameter types"));
+        renameParams.set("new_name", createStringParam("New name"));
+        renameParams.set("preview", createBooleanParam("Preview changes only"));
+        ArrayNode renameRequired = objectMapper.createArrayNode();
+        renameRequired.add("element_type");
+        renameRequired.add("class_name");
+        renameRequired.add("new_name");
+        renameTool.set("inputSchema", createInputSchema(renameParams, renameRequired));
         tools.add(renameTool);
         
         ObjectNode result = objectMapper.createObjectNode();
@@ -344,33 +386,54 @@ public class JavaMCPServer {
     private JsonNode handleToolCall(JsonNode id, JsonNode params) {
         String toolName = params.path("name").asText();
         JsonNode arguments = params.path("arguments");
-        
+
         logger.debug("Tool call: name={}, args={}", toolName, arguments);
-        
+
         try {
+            JsonNode toolResult;
             switch (toolName) {
                 case "initialize_project":
-                    return handleInitializeProject(id, arguments);
+                    toolResult = handleInitializeProject(id, arguments);
+                    break;
                 case "get_call_hierarchy":
-                    return handleGetCallHierarchy(id, arguments);
+                    toolResult = handleGetCallHierarchy(id, arguments);
+                    break;
                 case "get_type_hierarchy":
-                    return handleGetTypeHierarchy(id, arguments);
+                    toolResult = handleGetTypeHierarchy(id, arguments);
+                    break;
                 case "find_references":
-                    return handleFindReferences(id, arguments);
+                    toolResult = handleFindReferences(id, arguments);
+                    break;
                 case "get_class_info":
-                    return handleGetClassInfo(id, arguments);
+                    toolResult = handleGetClassInfo(id, arguments);
+                    break;
                 case "list_classes":
-                    return handleListClasses(id, arguments);
+                    toolResult = handleListClasses(id, arguments);
+                    break;
                 case "get_method_info":
-                    return handleGetMethodInfo(id, arguments);
+                    toolResult = handleGetMethodInfo(id, arguments);
+                    break;
                 case "refactor_rename":
-                    return handleRefactorRename(id, arguments);
+                    toolResult = handleRefactorRename(id, arguments);
+                    break;
                 default:
-                    return createErrorResponse(id, "unknown_tool", "Unknown tool: " + toolName);
+                    return createToolErrorResponse(id, "Unknown tool: " + toolName);
             }
+
+            // Check if the tool returned an error response
+            if (toolResult.has("error")) {
+                // It's already an error response, return as-is
+                return toolResult;
+            }
+
+            // For successful tool calls, we need to wrap the result in MCP format
+            // Extract the result from the standard response
+            JsonNode resultData = toolResult.path("result");
+            return createToolSuccessResponse(id, resultData);
+
         } catch (Exception e) {
             logger.error("Error executing tool: {}", toolName, e);
-            return createErrorResponse(id, "tool_error", "Tool execution failed: " + e.getMessage());
+            return createToolErrorResponse(id, "Tool execution failed: " + e.getMessage());
         }
     }
     
@@ -474,20 +537,28 @@ public class JavaMCPServer {
             return createErrorResponse(id, "not_initialized", "Project not initialized");
         }
         
-        List<org.eclipse.jdt.core.IType> types = projectAnalyzer.getAllTypes();
         ArrayNode classList = objectMapper.createArrayNode();
         
-        for (org.eclipse.jdt.core.IType type : types) {
-            ObjectNode typeInfo = objectMapper.createObjectNode();
-            typeInfo.put("fullyQualifiedName", type.getFullyQualifiedName());
-            typeInfo.put("simpleName", type.getElementName());
-            typeInfo.put("packageName", type.getPackageFragment().getElementName());
-            classList.add(typeInfo);
+        // Check if we're in basic mode
+        if (projectAnalyzer.isBasicMode()) {
+            List<String> classes = projectAnalyzer.getBasicAnalyzer().getAllClasses();
+            for (String className : classes) {
+                classList.add(className);
+            }
+        } else {
+            List<org.eclipse.jdt.core.IType> types = projectAnalyzer.getAllTypes();
+            for (org.eclipse.jdt.core.IType type : types) {
+                ObjectNode typeInfo = objectMapper.createObjectNode();
+                typeInfo.put("fullyQualifiedName", type.getFullyQualifiedName());
+                typeInfo.put("simpleName", type.getElementName());
+                typeInfo.put("packageName", type.getPackageFragment().getElementName());
+                classList.add(typeInfo);
+            }
         }
         
         ObjectNode result = objectMapper.createObjectNode();
         result.set("classes", classList);
-        result.put("totalCount", types.size());
+        result.put("totalCount", classList.size());
         
         return createSuccessResponse(id, result);
     }
@@ -529,6 +600,11 @@ public class JavaMCPServer {
     }
     
     private Map<String, Object> getDetailedClassInfo(String className) throws CoreException {
+        // Check if we're in basic mode
+        if (projectAnalyzer.isBasicMode()) {
+            return projectAnalyzer.getBasicAnalyzer().getClassInfo(className);
+        }
+        
         org.eclipse.jdt.core.IType type = projectAnalyzer.findType(className);
         if (type == null) {
             Map<String, Object> result = new HashMap<>();
@@ -621,21 +697,24 @@ public class JavaMCPServer {
         return result;
     }
     
-    private ObjectNode createInputSchema(ObjectNode properties) {
+    private ObjectNode createInputSchema(ObjectNode properties, ArrayNode required) {
         ObjectNode schema = objectMapper.createObjectNode();
         schema.put("type", "object");
         schema.set("properties", properties);
+        if (required != null && required.size() > 0) {
+            schema.set("required", required);
+        }
         return schema;
     }
     
-    private ObjectNode createStringParam(String description, boolean required) {
+    private ObjectNode createStringParam(String description) {
         ObjectNode param = objectMapper.createObjectNode();
         param.put("type", "string");
         param.put("description", description);
         return param;
     }
     
-    private ObjectNode createArrayParam(String description, boolean required) {
+    private ObjectNode createArrayParam(String description) {
         ObjectNode param = objectMapper.createObjectNode();
         param.put("type", "array");
         param.put("description", description);
@@ -645,7 +724,7 @@ public class JavaMCPServer {
         return param;
     }
     
-    private ObjectNode createBooleanParam(String description, boolean required) {
+    private ObjectNode createBooleanParam(String description) {
         ObjectNode param = objectMapper.createObjectNode();
         param.put("type", "boolean");
         param.put("description", description);
@@ -657,6 +736,62 @@ public class JavaMCPServer {
         response.set("result", result);
         response.put("jsonrpc", "2.0");
         response.set("id", id);
+        return response;
+    }
+
+    private JsonNode createToolSuccessResponse(JsonNode id, JsonNode data) {
+        // Create the content array with a text item containing the JSON data
+        ArrayNode content = objectMapper.createArrayNode();
+        ObjectNode textContent = objectMapper.createObjectNode();
+        textContent.put("type", "text");
+
+        // Convert the data to a pretty-printed JSON string
+        String jsonText;
+        try {
+            jsonText = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(data);
+        } catch (Exception e) {
+            jsonText = data.toString();
+        }
+        textContent.put("text", jsonText);
+        content.add(textContent);
+
+        // Create the result with content and isError
+        ObjectNode result = objectMapper.createObjectNode();
+        result.set("content", content);
+        result.put("isError", false);
+
+        // Wrap in standard JSON-RPC response
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("result", result);
+        response.put("jsonrpc", "2.0");
+        response.set("id", id);
+        return response;
+    }
+
+    private JsonNode createToolErrorResponse(Object id, String errorMessage) {
+        // Create the content array with error message
+        ArrayNode content = objectMapper.createArrayNode();
+        ObjectNode textContent = objectMapper.createObjectNode();
+        textContent.put("type", "text");
+        textContent.put("text", errorMessage);
+        content.add(textContent);
+
+        // Create the result with content and isError
+        ObjectNode result = objectMapper.createObjectNode();
+        result.set("content", content);
+        result.put("isError", true);
+
+        // Wrap in standard JSON-RPC response
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("result", result);
+        response.put("jsonrpc", "2.0");
+        if (id instanceof JsonNode) {
+            response.set("id", (JsonNode) id);
+        } else if (id instanceof String) {
+            response.put("id", (String) id);
+        } else {
+            response.putPOJO("id", id);
+        }
         return response;
     }
     

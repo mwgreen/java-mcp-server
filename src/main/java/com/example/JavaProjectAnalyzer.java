@@ -25,6 +25,7 @@ public class JavaProjectAnalyzer {
     private boolean initialized = false;
     
     private boolean workspaceAvailable = false;
+    private BasicModeAnalyzer basicAnalyzer;
     
     public JavaProjectAnalyzer() {
         // Lazy initialization - don't try Eclipse workspace until needed
@@ -48,6 +49,37 @@ public class JavaProjectAnalyzer {
         }
         
         this.projectName = path.getFileName().toString();
+        
+        // Try to initialize Eclipse workspace if not already done
+        if (!workspaceAvailable) {
+            try {
+                logger.info("Attempting to initialize Eclipse workspace...");
+                // Initialize Eclipse workspace on first use
+                if (workspaceRoot == null) {
+                    // This will trigger Eclipse workspace initialization in JavaMCPServer
+                    JavaMCPServer.ensureEclipseWorkspace();
+                    
+                    // Try to get workspace root - may fail if OSGi isn't fully initialized
+                    try {
+                        IWorkspace workspace = ResourcesPlugin.getWorkspace();
+                        if (workspace != null) {
+                            workspaceRoot = workspace.getRoot();
+                            workspaceAvailable = true;
+                            logger.info("Eclipse workspace is now available");
+                        } else {
+                            logger.warn("Workspace is null, will use basic mode");
+                            workspaceAvailable = false;
+                        }
+                    } catch (Exception wsEx) {
+                        logger.warn("Could not access Eclipse workspace: {}", wsEx.getMessage());
+                        workspaceAvailable = false;
+                    }
+                }
+            } catch (Exception e) {
+                logger.warn("Could not initialize Eclipse environment: {}", e.getMessage());
+                workspaceAvailable = false;
+            }
+        }
         
         if (workspaceAvailable) {
             try {
@@ -99,6 +131,7 @@ public class JavaProjectAnalyzer {
         logger.info("Initializing project in basic file analysis mode: {}", projectPath);
         // In basic mode, we'll work with file system scanning
         // This provides limited functionality but allows the server to work
+        basicAnalyzer = new BasicModeAnalyzer(projectPath);
     }
     
     
@@ -232,6 +265,14 @@ public class JavaProjectAnalyzer {
     
     public IJavaProject getJavaProject() {
         return javaProject;
+    }
+    
+    public BasicModeAnalyzer getBasicAnalyzer() {
+        return basicAnalyzer;
+    }
+    
+    public boolean isBasicMode() {
+        return !workspaceAvailable && basicAnalyzer != null;
     }
     
     public boolean isInitialized() {

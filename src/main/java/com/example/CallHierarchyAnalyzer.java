@@ -280,6 +280,14 @@ public class CallHierarchyAnalyzer {
                                               boolean includeCallees) throws CoreException {
         Map<String, Object> hierarchy = new HashMap<>();
         
+        // Check if we're in basic mode
+        if (projectAnalyzer.isBasicMode()) {
+            BasicModeAnalyzer basicAnalyzer = projectAnalyzer.getBasicAnalyzer();
+            List<String> paramTypes = parameterTypes != null ? Arrays.asList(parameterTypes) : null;
+            return basicAnalyzer.getCallHierarchy(fullyQualifiedClassName, methodName, 
+                                                 paramTypes, includeCallers, includeCallees);
+        }
+        
         IMethod method = findMethod(fullyQualifiedClassName, methodName, parameterTypes);
         if (method == null) {
             hierarchy.put("error", "Method not found: " + fullyQualifiedClassName + "." + methodName);
