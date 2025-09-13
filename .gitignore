@@ -1,0 +1,33 @@
+# Java
+target/
+*.class
+*.jar
+!target/java-mcp-server-*.jar
+dependency-reduced-pom.xml
+
+# Eclipse
+.settings/
+.project
+.classpath
+
+# IntelliJ
+.idea/
+*.iml
+
+# VS Code
+.vscode/
+
+# Mac
+.DS_Store
+
+# MCP runtime files
+.java-backend.pid
+server.log
+
+# Node modules (if any get added)
+node_modules/
+
+# Temp files
+*.tmp
+*.log
+*~

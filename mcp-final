@@ -1,0 +1,166 @@
+#!/usr/bin/env node
+
+// MCP bridge that connects Claude Code to Java backend
+const net = require('net');
+const readline = require('readline');
+const { spawn } = require('child_process');
+const path = require('path');
+const fs = require('fs');
+
+const JAVA_PORT = 9876;
+const JAR_PATH = path.join(__dirname, 'target', 'java-mcp-server-1.0.0.jar');
+const PID_FILE = path.join(__dirname, '.java-backend.pid');
+
+let javaConnection = null;
+let requestBuffer = '';
+
+// Start Java backend if needed (async, non-blocking)
+function ensureJavaBackend() {
+  setImmediate(() => {
+    if (fs.existsSync(PID_FILE)) {
+      try {
+        const pid = parseInt(fs.readFileSync(PID_FILE, 'utf8'));
+        process.kill(pid, 0);
+        connectToJava(); // Already running
+        return;
+      } catch (e) {
+        fs.unlinkSync(PID_FILE);
+      }
+    }
+    
+    // Start Java backend
+    const proc = spawn('java', [
+      '-Xmx2G', '-Xms512M',
+      '-Dserver.port=' + JAVA_PORT,
+      '-jar', JAR_PATH,
+      '--tcp-mode'
+    ], {
+      detached: true,
+      stdio: 'ignore'
+    });
+    
+    proc.unref();
+    fs.writeFileSync(PID_FILE, String(proc.pid));
+    
+    // Try to connect after a delay
+    setTimeout(connectToJava, 2000);
+  });
+}
+
+// Connect to Java backend (non-blocking)
+function connectToJava() {
+  if (javaConnection) return;
+  
+  const client = new net.Socket();
+  
+  client.on('connect', () => {
+    javaConnection = client;
+    
+    client.on('data', (data) => {
+      requestBuffer += data.toString();
+      const lines = requestBuffer.split('\n');
+      requestBuffer = lines.pop();
+      
+      lines.forEach(line => {
+        if (line.trim()) {
+          console.log(line);
+        }
+      });
+    });
+    
+    client.on('close', () => {
+      javaConnection = null;
+      setTimeout(connectToJava, 5000);
+    });
+  });
+  
+  client.on('error', () => {
+    setTimeout(connectToJava, 5000);
+  });
+  
+  client.connect(JAVA_PORT, 'localhost');
+}
+
+// Set up stdin handler
+const rl = readline.createInterface({
+  input: process.stdin,
+  terminal: false
+});
+
+rl.on('line', (line) => {
+  if (!line.trim()) return;
+  
+  try {
+    const request = JSON.parse(line);
+    
+    // Handle initialize immediately
+    if (request.method === 'initialize') {
+      const response = {
+        result: {
+          protocolVersion: request.params?.protocolVersion || "2024-11-05",
+          capabilities: { tools: {} },
+          serverInfo: { name: "Java MCP Server", version: "1.0.0" }
+        },
+        jsonrpc: "2.0",
+        id: request.id
+      };
+      console.log(JSON.stringify(response));
+      
+      if (javaConnection) {
+        javaConnection.write(line + '\n');
+      }
+      return;
+    }
+    
+    // Handle notifications
+    if (request.method === 'notifications/initialized') {
+      if (javaConnection) {
+        javaConnection.write(line + '\n');
+      }
+      return;
+    }
+    
+    // Handle tools/list
+    if (request.method === 'tools/list') {
+      if (javaConnection) {
+        javaConnection.write(line + '\n');
+      } else {
+        const response = {
+          result: {
+            tools: [{
+              name: "initialize_project",
+              description: "Initialize Java project analysis (backend starting...)"
+            }]
+          },
+          jsonrpc: "2.0",
+          id: request.id
+        };
+        console.log(JSON.stringify(response));
+      }
+      return;
+    }
+    
+    // Forward other requests to Java
+    if (javaConnection) {
+      javaConnection.write(line + '\n');
+    } else {
+      const response = {
+        error: {
+          code: -32603,
+          message: "Java backend is starting, please retry"
+        },
+        jsonrpc: "2.0",
+        id: request.id
+      };
+      console.log(JSON.stringify(response));
+    }
+  } catch (e) {
+    // Ignore parse errors
+  }
+});
+
+// Start Java backend asynchronously
+ensureJavaBackend();
+
+// Keep process alive
+process.stdin.resume();
