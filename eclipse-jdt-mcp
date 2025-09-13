@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// MCP bridge that connects Claude Code to Java backend
+// eclipse-jdt-mcp: MCP bridge for Eclipse JDT Java analysis server
 const net = require('net');
 const readline = require('readline');
 const { spawn } = require('child_process');

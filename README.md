@@ -43,12 +43,12 @@ mvn clean package
 
 **For current project only (local):**
 ```bash
-claude mcp add java-analyzer -s local -- /path/to/java-mcp-server/mcp-final
+claude mcp add java-analyzer -s local -- /path/to/java-mcp-server/eclipse-jdt-mcp
 ```
 
 **For all projects (global):**
 ```bash
-claude mcp add java-analyzer -s global -- /path/to/java-mcp-server/mcp-final
+claude mcp add java-analyzer -s global -- /path/to/java-mcp-server/eclipse-jdt-mcp
 ```
 
 4. Verify installation:
@@ -56,7 +56,7 @@ claude mcp add java-analyzer -s global -- /path/to/java-mcp-server/mcp-final
 claude mcp list
 ```
 
-You should see: `java-analyzer: /path/to/java-mcp-server/mcp-final - ✓ Connected`
+You should see: `java-analyzer: /path/to/java-mcp-server/eclipse-jdt-mcp - ✓ Connected`
 
 ## MCP Tools
 
@@ -226,12 +226,12 @@ Rename symbols across the project with preview support.
 The server uses a **bridge architecture** to work around Claude Code's strict timeout requirements:
 
 ```
-Claude Code → Node.js Bridge (mcp-final) → Java Backend (TCP port 9876)
+Claude Code → Node.js Bridge (eclipse-jdt-mcp) → Java Backend (TCP port 9876)
      ↓              ↓                            ↓
   stdio         instant response          Eclipse JDT analysis
 ```
 
-1. **Node.js Bridge** (`mcp-final`): Responds instantly to Claude Code's health checks
+1. **Node.js Bridge** (`eclipse-jdt-mcp`): Responds instantly to Claude Code's health checks
 2. **Java Backend**: Runs as a persistent TCP server providing the actual analysis
 3. **Automatic Management**: The bridge starts/stops the Java backend as needed
 
@@ -408,7 +408,7 @@ java-mcp-server/
 │   ├── TypeHierarchyAnalyzer.java
 │   ├── ReferencesFinder.java
 │   └── RefactoringEngine.java
-├── mcp-final                     # Node.js bridge for Claude Code
+├── eclipse-jdt-mcp               # Node.js bridge for Claude Code
 ├── scripts/
 │   ├── stop-backend.sh          # Stop Java backend
 │   └── launch-server.bat        # Windows launcher
