@@ -1,87 +1,109 @@
 #!/usr/bin/env node
 
 // eclipse-jdt-mcp: MCP bridge for Eclipse JDT Java analysis server
-const net = require('net');
-const readline = require('readline');
+// Manages Java process lifecycle - spawns on demand, kills on exit
+
 const { spawn } = require('child_process');
+const readline = require('readline');
 const path = require('path');
-const fs = require('fs');
+const crypto = require('crypto');
 
-const JAVA_PORT = 9876;
 const JAR_PATH = path.join(__dirname, 'target', 'java-mcp-server-1.0.0.jar');
-const PID_FILE = path.join(__dirname, '.java-backend.pid');
 
-let javaConnection = null;
+let javaProcess = null;
+let javaReady = false;
+let initializeRequest = null;
 let requestBuffer = '';
+let pendingRequests = [];
 
-// Start Java backend if needed (async, non-blocking)
-function ensureJavaBackend() {
-  setImmediate(() => {
-    if (fs.existsSync(PID_FILE)) {
-      try {
-        const pid = parseInt(fs.readFileSync(PID_FILE, 'utf8'));
-        process.kill(pid, 0);
-        connectToJava(); // Already running
-        return;
-      } catch (e) {
-        fs.unlinkSync(PID_FILE);
-      }
-    }
-    
-    // Start Java backend
-    const proc = spawn('java', [
-      '-Xmx2G', '-Xms512M',
-      '-Dserver.port=' + JAVA_PORT,
-      '-jar', JAR_PATH,
-      '--tcp-mode'
-    ], {
-      detached: true,
-      stdio: 'ignore'
-    });
-    
-    proc.unref();
-    fs.writeFileSync(PID_FILE, String(proc.pid));
-    
-    // Try to connect after a delay
-    setTimeout(connectToJava, 2000);
+// Generate unique ID for this session (for multi-project support)
+const sessionId = crypto.randomBytes(4).toString('hex');
+console.error(`[eclipse-jdt-mcp] Session ${sessionId} starting`);
+
+// Function to start Java backend
+function startJavaBackend() {
+  if (javaProcess) return;
+  
+  console.error(`[eclipse-jdt-mcp] Starting Java backend for session ${sessionId}`);
+  
+  javaProcess = spawn('java', [
+    '-Xmx2G',
+    '-Xms512M',
+    `-Dsession.id=${sessionId}`,
+    '-Dorg.slf4j.simpleLogger.logFile=System.err',
+    '-Dorg.slf4j.simpleLogger.defaultLogLevel=error',
+    '-jar',
+    JAR_PATH
+  ], {
+    stdio: ['pipe', 'pipe', 'pipe']
   });
-}
-
-// Connect to Java backend (non-blocking)
-function connectToJava() {
-  if (javaConnection) return;
   
-  const client = new net.Socket();
-  
-  client.on('connect', () => {
-    javaConnection = client;
+  // Handle Java stdout (responses)
+  javaProcess.stdout.on('data', (data) => {
+    requestBuffer += data.toString();
+    const lines = requestBuffer.split('\n');
+    requestBuffer = lines.pop(); // Keep incomplete line in buffer
     
-    client.on('data', (data) => {
-      requestBuffer += data.toString();
-      const lines = requestBuffer.split('\n');
-      requestBuffer = lines.pop();
-      
-      lines.forEach(line => {
-        if (line.trim()) {
-          console.log(line);
+    lines.forEach(line => {
+      if (line.trim()) {
+        try {
+          const response = JSON.parse(line);
+          console.log(JSON.stringify(response));
+          
+          // If this was the initialization response, mark Java as ready
+          if (response.result && initializeRequest) {
+            javaReady = true;
+            initializeRequest = null;
+            processPendingRequests();
+          }
+        } catch (e) {
+          console.error(`[eclipse-jdt-mcp] Failed to parse Java response: ${e.message}`);
         }
-      });
+      }
     });
+  });
+  
+  // Handle Java stderr (logging)
+  javaProcess.stderr.on('data', (data) => {
+    // Log Java errors to stderr with prefix
+    const lines = data.toString().split('\n');
+    lines.forEach(line => {
+      if (line.trim()) {
+        console.error(`[Java] ${line}`);
+      }
+    });
+  });
+  
+  // Handle Java process exit
+  javaProcess.on('exit', (code, signal) => {
+    console.error(`[eclipse-jdt-mcp] Java backend exited (code: ${code}, signal: ${signal})`);
+    javaProcess = null;
+    javaReady = false;
     
-    client.on('close', () => {
-      javaConnection = null;
-      setTimeout(connectToJava, 5000);
-    });
+    // If Node is still running but Java died, restart might be needed
+    if (code !== 0 && code !== null) {
+      console.error(`[eclipse-jdt-mcp] Java backend crashed, will restart on next request`);
+    }
   });
   
-  client.on('error', () => {
-    setTimeout(connectToJava, 5000);
+  javaProcess.on('error', (err) => {
+    console.error(`[eclipse-jdt-mcp] Failed to start Java backend: ${err.message}`);
+    javaProcess = null;
+    javaReady = false;
   });
-  
-  client.connect(JAVA_PORT, 'localhost');
 }
 
-// Set up stdin handler
+// Function to process pending requests
+function processPendingRequests() {
+  while (pendingRequests.length > 0 && javaReady) {
+    const request = pendingRequests.shift();
+    if (javaProcess && javaProcess.stdin.writable) {
+      javaProcess.stdin.write(request + '\n');
+    }
+  }
+}
+
+// Set up stdin reader
 const rl = readline.createInterface({
   input: process.stdin,
   terminal: false
@@ -93,38 +115,65 @@ rl.on('line', (line) => {
   try {
     const request = JSON.parse(line);
     
-    // Handle initialize immediately
+    // Handle initialize specially
     if (request.method === 'initialize') {
+      // Always respond immediately to Claude Code
       const response = {
         result: {
           protocolVersion: request.params?.protocolVersion || "2024-11-05",
           capabilities: { tools: {} },
-          serverInfo: { name: "Java MCP Server", version: "1.0.0" }
+          serverInfo: { 
+            name: "Eclipse JDT Java Analyzer", 
+            version: "1.0.0"
+          }
         },
         jsonrpc: "2.0",
         id: request.id
       };
       console.log(JSON.stringify(response));
       
-      if (javaConnection) {
-        javaConnection.write(line + '\n');
+      // Start Java backend if not already running
+      if (!javaProcess) {
+        startJavaBackend();
+      }
+      
+      // Forward to Java for actual initialization
+      if (javaProcess && javaProcess.stdin.writable) {
+        initializeRequest = line;
+        javaProcess.stdin.write(line + '\n');
       }
       return;
     }
     
     // Handle notifications
     if (request.method === 'notifications/initialized') {
-      if (javaConnection) {
-        javaConnection.write(line + '\n');
+      // Forward to Java if ready
+      if (javaProcess && javaProcess.stdin.writable) {
+        javaProcess.stdin.write(line + '\n');
       }
-      return;
+      return; // No response needed
     }
     
-    // Handle tools/list
-    if (request.method === 'tools/list') {
-      if (javaConnection) {
-        javaConnection.write(line + '\n');
-      } else {
+    // For other requests, forward to Java or queue
+    if (javaReady && javaProcess && javaProcess.stdin.writable) {
+      javaProcess.stdin.write(line + '\n');
+    } else if (!javaProcess) {
+      // Java not started yet (shouldn't happen after initialize)
+      const response = {
+        error: {
+          code: -32603,
+          message: "Backend not initialized. Please call initialize first."
+        },
+        jsonrpc: "2.0",
+        id: request.id
+      };
+      console.log(JSON.stringify(response));
+    } else {
+      // Java starting, queue the request
+      pendingRequests.push(line);
+      
+      // Provide a temporary response for tools/list
+      if (request.method === 'tools/list') {
         const response = {
           result: {
             tools: [{
@@ -137,30 +186,46 @@ rl.on('line', (line) => {
         };
         console.log(JSON.stringify(response));
       }
-      return;
-    }
-    
-    // Forward other requests to Java
-    if (javaConnection) {
-      javaConnection.write(line + '\n');
-    } else {
-      const response = {
-        error: {
-          code: -32603,
-          message: "Java backend is starting, please retry"
-        },
-        jsonrpc: "2.0",
-        id: request.id
-      };
-      console.log(JSON.stringify(response));
     }
   } catch (e) {
-    // Ignore parse errors
+    console.error(`[eclipse-jdt-mcp] Failed to parse request: ${e.message}`);
   }
 });
 
-// Start Java backend asynchronously
-ensureJavaBackend();
+// Clean shutdown - kill Java when Node exits
+function cleanup() {
+  console.error(`[eclipse-jdt-mcp] Shutting down session ${sessionId}`);
+  
+  if (javaProcess) {
+    console.error(`[eclipse-jdt-mcp] Terminating Java backend`);
+    javaProcess.kill('SIGTERM');
+    
+    // Give it 1 second to terminate gracefully
+    setTimeout(() => {
+      if (javaProcess) {
+        console.error(`[eclipse-jdt-mcp] Force killing Java backend`);
+        javaProcess.kill('SIGKILL');
+      }
+    }, 1000);
+  }
+  
+  process.exit(0);
+}
+
+// Register cleanup handlers
+process.on('SIGTERM', cleanup);
+process.on('SIGINT', cleanup);
+process.on('exit', () => {
+  if (javaProcess) {
+    javaProcess.kill('SIGKILL');
+  }
+});
+
+// Handle stdin close
+rl.on('close', () => {
+  console.error(`[eclipse-jdt-mcp] Stdin closed, shutting down`);
+  cleanup();
+});
 
 // Keep process alive
 process.stdin.resume();

@@ -14,7 +14,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.*;
-import java.net.*;
 import java.util.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -90,37 +89,17 @@ public class JavaMCPServer {
     }
     
     public void run() {
-        // No startup logging for faster response
+        // Log session ID if provided
+        String sessionId = System.getProperty("session.id", "default");
+        logger.info("Java MCP Server started (session: {})", sessionId);
         
         // Use unbuffered output for immediate response
         PrintWriter writer = new PrintWriter(new OutputStreamWriter(System.out), false);
         BufferedReader reader = new BufferedReader(new InputStreamReader(System.in));
         
-        // Keep track of EOF encounters
-        int eofCount = 0;
-        final int MAX_EOF_RETRIES = 50; // Wait for up to 5 seconds (50 * 100ms)
-        
         try {
             String line;
-            while (eofCount < MAX_EOF_RETRIES) {
-                line = reader.readLine();
-                
-                if (line == null) {
-                    // EOF encountered - wait a bit and retry
-                    eofCount++;
-                    if (eofCount == 1) {
-                        logger.debug("EOF on stdin, waiting for reconnection...");
-                    }
-                    try {
-                        Thread.sleep(100); // Wait 100ms before retry
-                    } catch (InterruptedException e) {
-                        break;
-                    }
-                    continue;
-                }
-                
-                // Reset EOF counter on successful read
-                eofCount = 0;
+            while ((line = reader.readLine()) != null) {
                 
                 // Skip empty lines
                 if (line.trim().isEmpty()) {
@@ -157,71 +136,6 @@ public class JavaMCPServer {
             } catch (IOException e) {
                 logger.error("Error closing streams", e);
             }
-        }
-    }
-    
-    public void runTcpServer(int port) {
-        System.err.println("Starting Java MCP TCP server on port " + port + "...");
-        
-        try (ServerSocket serverSocket = new ServerSocket(port)) {
-            System.err.println("Java MCP TCP server listening on port " + port);
-            
-            while (true) {
-                try {
-                    Socket clientSocket = serverSocket.accept();
-                    logger.info("Client connected from {}", clientSocket.getRemoteSocketAddress());
-                    
-                    // Handle each client in a new thread
-                    new Thread(() -> handleTcpClient(clientSocket)).start();
-                } catch (IOException e) {
-                    logger.error("Error accepting client connection", e);
-                }
-            }
-        } catch (IOException e) {
-            logger.error("Failed to start TCP server on port {}", port, e);
-        }
-    }
-    
-    private void handleTcpClient(Socket clientSocket) {
-        try (
-            BufferedReader reader = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
-            PrintWriter writer = new PrintWriter(new OutputStreamWriter(clientSocket.getOutputStream()), false)
-        ) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                // Skip empty lines
-                if (line.trim().isEmpty()) {
-                    continue;
-                }
-                
-                try {
-                    JsonNode request = objectMapper.readTree(line);
-                    JsonNode response = handleRequest(request);
-                    
-                    if (response != null) {
-                        String responseStr = objectMapper.writeValueAsString(response);
-                        writer.println(responseStr);
-                        writer.flush();
-                        logger.debug("Sent response: {}", responseStr);
-                    }
-                } catch (Exception e) {
-                    logger.error("Error processing request: {}", line, e);
-                    JsonNode errorResponse = createErrorResponse(null, "parse_error", "Invalid JSON-RPC request");
-                    String errorStr = objectMapper.writeValueAsString(errorResponse);
-                    writer.println(errorStr);
-                    writer.flush();
-                    logger.debug("Sent error response: {}", errorStr);
-                }
-            }
-        } catch (IOException e) {
-            logger.error("Error handling TCP client", e);
-        } finally {
-            try {
-                clientSocket.close();
-            } catch (IOException e) {
-                logger.error("Error closing client socket", e);
-            }
-            logger.info("Client disconnected");
         }
     }
     

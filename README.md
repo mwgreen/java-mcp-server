@@ -223,17 +223,28 @@ Rename symbols across the project with preview support.
 
 ### Architecture
 
-The server uses a **bridge architecture** to work around Claude Code's strict timeout requirements:
+The server uses a **managed process architecture** for reliable Claude Code integration:
 
 ```
-Claude Code → Node.js Bridge (eclipse-jdt-mcp) → Java Backend (TCP port 9876)
+Claude Code → Node.js Bridge (eclipse-jdt-mcp) → Java Backend Process
      ↓              ↓                            ↓
   stdio         instant response          Eclipse JDT analysis
 ```
 
-1. **Node.js Bridge** (`eclipse-jdt-mcp`): Responds instantly to Claude Code's health checks
-2. **Java Backend**: Runs as a persistent TCP server providing the actual analysis
-3. **Automatic Management**: The bridge starts/stops the Java backend as needed
+1. **Node.js Bridge** (`eclipse-jdt-mcp`): 
+   - Responds instantly to Claude Code's health checks
+   - Spawns and manages Java backend lifecycle
+   - Each project gets its own Java process (multi-project support)
+   
+2. **Java Backend**: 
+   - Runs as a subprocess of the Node.js bridge
+   - Provides full Eclipse JDT analysis capabilities
+   - Automatically terminated when bridge exits
+   
+3. **Automatic Management**: 
+   - Java starts on first request
+   - Requests queued while Java initializes
+   - Clean shutdown on exit
 
 ### Why the Bridge?
 
@@ -346,21 +357,16 @@ The server consists of several key components:
 - **Runtime**: Java 17+ required to run the server
 - **Build**: Maven 3.6+ for building the server
 
-## Managing the Backend
+## Process Management
 
-The Java backend runs automatically when needed. If you need to manage it manually:
+The Java backend is automatically managed by the Node.js bridge:
 
-**Stop the backend:**
-```bash
-./scripts/stop-backend.sh
-```
+- **Starts automatically** when you use a Java analysis tool
+- **Runs as a subprocess** of eclipse-jdt-mcp
+- **Terminates cleanly** when Claude Code disconnects
+- **One process per project** for isolation
 
-**Check if backend is running:**
-```bash
-ps aux | grep java-mcp-server
-```
-
-The backend runs on TCP port 9876 by default.
+No manual management needed! The bridge handles everything.
 
 ## Limitations
 
@@ -410,7 +416,6 @@ java-mcp-server/
 │   └── RefactoringEngine.java
 ├── eclipse-jdt-mcp               # Node.js bridge for Claude Code
 ├── scripts/
-│   ├── stop-backend.sh          # Stop Java backend
 │   └── launch-server.bat        # Windows launcher
 └── pom.xml                      # Maven configuration
 ```
