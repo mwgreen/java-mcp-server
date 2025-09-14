@@ -1257,15 +1257,78 @@ async function getCallHierarchy(className, methodName, parameterTypes, includeCa
     throw new Error('JDT.LS not initialized. Call initialize_project first.');
   }
 
-  // Note: Full call hierarchy requires JDT.LS extensions
-  // This is a placeholder implementation
-  return {
+  // First find the method symbol
+  const symbols = await sendRequest('workspace/symbol', { query: methodName });
+  if (!symbols || symbols.length === 0) {
+    return {
+      class: className,
+      method: methodName,
+      error: 'Method not found'
+    };
+  }
+
+  const methodSymbol = symbols.find(s =>
+    s.kind === 6 && // Method
+    s.name === methodName &&
+    s.containerName?.includes(className)
+  );
+
+  if (!methodSymbol) {
+    return {
+      class: className,
+      method: methodName,
+      error: 'Method not found in specified class'
+    };
+  }
+
+  // Prepare call hierarchy using textDocument/prepareCallHierarchy
+  const prepareParams = {
+    textDocument: { uri: methodSymbol.location.uri },
+    position: methodSymbol.location.range.start
+  };
+
+  const items = await sendRequest('textDocument/prepareCallHierarchy', prepareParams);
+  if (!items || items.length === 0) {
+    return {
+      class: className,
+      method: methodName,
+      callers: [],
+      callees: []
+    };
+  }
+
+  const result = {
     class: className,
     method: methodName,
-    callers: includeCallers ? [] : null,
-    callees: includeCallees ? [] : null,
-    message: 'Call hierarchy requires additional JDT.LS protocol extensions'
+    callers: [],
+    callees: []
   };
+
+  // Get incoming calls (callers)
+  if (includeCallers) {
+    const incomingCalls = await sendRequest('callHierarchy/incomingCalls', { item: items[0] });
+    if (incomingCalls) {
+      result.callers = incomingCalls.map(call => ({
+        class: call.from.detail || '',
+        method: call.from.name,
+        location: `${call.from.uri}:${call.from.range.start.line + 1}`
+      }));
+    }
+  }
+
+  // Get outgoing calls (callees)
+  if (includeCallees) {
+    const outgoingCalls = await sendRequest('callHierarchy/outgoingCalls', { item: items[0] });
+    if (outgoingCalls) {
+      result.callees = outgoingCalls.map(call => ({
+        class: call.to.detail || '',
+        method: call.to.name,
+        location: `${call.to.uri}:${call.to.range.start.line + 1}`
+      }));
+    }
+  }
+
+  return result;
 }
 
 async function getTypeHierarchy(typeName) {
@@ -1283,13 +1346,61 @@ async function getTypeHierarchy(typeName) {
     };
   }
 
-  // Note: Full type hierarchy requires JDT.LS extensions
-  return {
+  // Find the class symbol
+  const classSymbol = symbols.find(s =>
+    (s.kind === 5 || s.kind === 23) && // Class or Interface
+    s.name === typeName
+  );
+
+  if (!classSymbol) {
+    return {
+      type: typeName,
+      error: 'Type not found'
+    };
+  }
+
+  // Prepare type hierarchy using textDocument/prepareTypeHierarchy
+  const prepareParams = {
+    textDocument: { uri: classSymbol.location.uri },
+    position: classSymbol.location.range.start
+  };
+
+  const items = await sendRequest('textDocument/prepareTypeHierarchy', prepareParams);
+  if (!items || items.length === 0) {
+    return {
+      type: typeName,
+      superTypes: [],
+      subTypes: []
+    };
+  }
+
+  const result = {
     type: typeName,
     superTypes: [],
-    subTypes: [],
-    message: 'Type hierarchy requires additional JDT.LS protocol extensions'
+    subTypes: []
   };
+
+  // Get supertypes
+  const supertypes = await sendRequest('typeHierarchy/supertypes', { item: items[0] });
+  if (supertypes) {
+    result.superTypes = supertypes.map(type => ({
+      name: type.name,
+      kind: type.kind === 5 ? 'class' : 'interface',
+      location: `${type.uri}:${type.range.start.line + 1}`
+    }));
+  }
+
+  // Get subtypes
+  const subtypes = await sendRequest('typeHierarchy/subtypes', { item: items[0] });
+  if (subtypes) {
+    result.subTypes = subtypes.map(type => ({
+      name: type.name,
+      kind: type.kind === 5 ? 'class' : 'interface',
+      location: `${type.uri}:${type.range.start.line + 1}`
+    }));
+  }
+
+  return result;
 }
 
 async function findReferences(className, memberName, parameterTypes, elementType) {
@@ -1297,7 +1408,7 @@ async function findReferences(className, memberName, parameterTypes, elementType
     throw new Error('JDT.LS not initialized. Call initialize_project first.');
   }
 
-  // This is the existing implementation from earlier
+  // Search for the symbol
   const query = memberName || className.split('.').pop();
   const symbols = await sendRequest('workspace/symbol', { query });
 
@@ -1406,9 +1517,34 @@ async function getMethodInfo(className, methodName, parameterTypes) {
     };
   }
 
+  // Get hover information for more details
+  const hoverInfo = await sendRequest('textDocument/hover', {
+    textDocument: { uri: methodSymbol.location.uri },
+    position: methodSymbol.location.range.start
+  });
+
+  let signature = methodName;
+  let documentation = '';
+
+  if (hoverInfo && hoverInfo.contents) {
+    if (typeof hoverInfo.contents === 'string') {
+      documentation = hoverInfo.contents;
+    } else if (hoverInfo.contents.value) {
+      const content = hoverInfo.contents.value;
+      // Extract method signature and documentation from hover content
+      const lines = content.split('\n');
+      if (lines.length > 0) {
+        signature = lines[0].replace(/^```java\s*/, '').replace(/```$/, '').trim();
+        documentation = lines.slice(1).join('\n').trim();
+      }
+    }
+  }
+
   return {
     class: className,
     method: methodName,
+    signature: signature,
+    documentation: documentation,
     location: methodSymbol.location?.uri?.replace('file://', ''),
     line: methodSymbol.location?.range?.start?.line + 1
   };
