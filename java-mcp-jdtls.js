@@ -190,9 +190,17 @@ async function startJDTLS(projectPath) {
     await initializeLSP(projectPath, projectType);
     log('info', 'initializeLSP completed');
 
-    ready = true;
-    initializing = false;
-    log('info', 'JDT.LS ready');
+    // Wait for workspace to be ready
+    log('info', 'Waiting for workspace to be ready...');
+    const isReady = await waitForWorkspaceReady(projectPath);
+
+    if (isReady) {
+      ready = true;
+      initializing = false;
+      log('info', 'JDT.LS ready and workspace indexed');
+    } else {
+      throw new Error('Workspace failed to become ready within timeout period');
+    }
 
   } catch (error) {
     initializing = false;
@@ -349,12 +357,33 @@ function sendMessage(message) {
   jdtlsProcess.stdin.write(content);
 }
 
-// Send request
-function sendRequest(method, params) {
+// Send request with configurable timeout
+function sendRequest(method, params, timeout = 60000) {
   return new Promise((resolve, reject) => {
     const id = requestId++;
+    let timeoutHandle;
 
-    responseHandlers.set(id, { resolve, reject });
+    const cleanup = () => {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
+      responseHandlers.delete(id);
+    };
+
+    const wrappedResolve = (result) => {
+      cleanup();
+      resolve(result);
+    };
+
+    const wrappedReject = (error) => {
+      cleanup();
+      reject(error);
+    };
+
+    responseHandlers.set(id, {
+      resolve: wrappedResolve,
+      reject: wrappedReject
+    });
 
     sendMessage({
       jsonrpc: '2.0',
@@ -363,12 +392,15 @@ function sendRequest(method, params) {
       params: params
     });
 
-    setTimeout(() => {
+    // Set timeout with better error message
+    timeoutHandle = setTimeout(() => {
       if (responseHandlers.has(id)) {
-        responseHandlers.delete(id);
-        reject(new Error(`Timeout: ${method}`));
+        cleanup();
+        const errorMsg = `Request timeout: ${method} after ${timeout}ms. The workspace may still be indexing.`;
+        log('error', errorMsg);
+        reject(new Error(errorMsg));
       }
-    }, 60000); // 60 second timeout for Gradle projects
+    }, timeout);
   });
 }
 
@@ -656,6 +688,46 @@ async function initializeLSP(projectPath, projectType) {
   return initResult;
 }
 
+// Wait for workspace to be ready by checking if we can query symbols
+async function waitForWorkspaceReady(projectPath, maxWaitTime = 120000) {
+  const startTime = Date.now();
+  const checkInterval = 5000; // Check every 5 seconds
+
+  while (Date.now() - startTime < maxWaitTime) {
+    try {
+      // Try to query workspace symbols with a short timeout
+      const result = await sendRequest('workspace/symbol', { query: '' }, 10000);
+
+      if (result && Array.isArray(result)) {
+        // Check if we have actual project classes (not just JDK)
+        const projectClasses = result.filter(s =>
+          s.location?.uri?.includes(projectPath) ||
+          !s.location?.uri?.includes('/jrt-fs/')
+        );
+
+        if (projectClasses.length > 0) {
+          log('info', `Workspace ready with ${projectClasses.length} project symbols indexed`);
+          return true;
+        } else {
+          log('info', 'Workspace symbols found but no project classes yet, waiting...');
+        }
+      }
+    } catch (e) {
+      log('debug', 'Workspace not ready yet:', e.message);
+    }
+
+    // Wait before next check
+    await new Promise(resolve => setTimeout(resolve, checkInterval));
+
+    // Show progress
+    const elapsed = Math.round((Date.now() - startTime) / 1000);
+    log('info', `Waiting for workspace indexing... ${elapsed}s elapsed`);
+  }
+
+  log('error', 'Workspace failed to become ready within timeout period');
+  return false;
+}
+
 // Find Gradle home
 function findGradleHome(projectPath) {
   // Check for gradle wrapper
@@ -761,6 +833,15 @@ function handleToolsList(id) {
           }
         },
         required: ['project_path']
+      }
+    },
+    {
+      name: 'check_status',
+      description: 'Check the status of the JDT.LS server and workspace',
+      inputSchema: {
+        type: 'object',
+        properties: {},
+        required: []
       }
     },
     {
@@ -989,6 +1070,10 @@ async function handleToolCall(id, params) {
         result = await initializeProject(args.project_path);
         break;
 
+      case 'check_status':
+        result = await checkServerStatus();
+        break;
+
       case 'get_symbols':
         result = await getSymbols(args.query);
         break;
@@ -1193,13 +1278,20 @@ async function listClasses() {
     // Use a more specific query to avoid getting too many results
     result = await sendRequest('workspace/symbol', {
       query: '*'
-    });
+    }, 30000); // 30 second timeout
   } catch (e) {
     log('error', 'Failed to get workspace symbols:', e.message);
+    if (e.message.includes('timeout')) {
+      return {
+        count: 0,
+        classes: [],
+        error: 'Request timed out. The workspace may still be indexing. Please wait a moment and try again.'
+      };
+    }
     return {
       count: 0,
       classes: [],
-      message: 'Failed to query workspace symbols: ' + e.message
+      error: 'Failed to query workspace symbols: ' + e.message
     };
   }
 
@@ -1251,6 +1343,50 @@ function sendMCPToolResult(id, data, isError = false) {
 }
 
 // Additional tool implementations for JDT.LS
+
+async function checkServerStatus() {
+  const status = {
+    jdtls_running: jdtlsProcess !== null,
+    jdtls_ready: ready,
+    initializing: initializing,
+    current_project: currentProject,
+    workspace_dir: WORKSPACE
+  };
+
+  // Try to get workspace symbols to check if server is responsive
+  if (ready) {
+    try {
+      const startTime = Date.now();
+      const symbols = await sendRequest('workspace/symbol', { query: '' }, 5000);
+      const responseTime = Date.now() - startTime;
+
+      status.server_responsive = true;
+      status.response_time_ms = responseTime;
+      status.indexed_symbols = symbols ? symbols.length : 0;
+
+      // Check if we have project symbols (not just JDK)
+      if (symbols && currentProject) {
+        const projectSymbols = symbols.filter(s =>
+          s.location?.uri?.includes(currentProject) ||
+          !s.location?.uri?.includes('/jrt-fs/')
+        );
+        status.project_symbols = projectSymbols.length;
+      }
+    } catch (e) {
+      status.server_responsive = false;
+      status.error = e.message;
+
+      if (e.message.includes('timeout')) {
+        status.suggestion = 'The server is not responding. The workspace may still be indexing. Please wait and try again.';
+      }
+    }
+  } else {
+    status.server_responsive = false;
+    status.suggestion = 'Server is not ready. Please call initialize_project first.';
+  }
+
+  return status;
+}
 
 async function getCallHierarchy(className, methodName, parameterTypes, includeCallers = true, includeCallees = true) {
   if (!ready) {
