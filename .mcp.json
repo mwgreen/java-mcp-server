@@ -1,8 +1,9 @@
 {
   "mcpServers": {
     "java-analyzer": {
-      "type": "stdio",
-      "command": "/Users/mwgreen/git-repos/java-mcp-server/eclipse-jdt-mcp"
+      "command": "node",
+      "args": ["/Users/mwgreen/git-repos/java-mcp-server/java-mcp-jdtls.js"],
+      "description": "Java code analysis with Eclipse JDT Language Server"
     }
   }
 }

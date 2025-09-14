@@ -58,16 +58,49 @@ function getConfigDir() {
   return path.join(JDTLS_HOME, configMap[platform] || 'config_linux');
 }
 
-// Detect project type
+// Detect project type and find root
 function detectProjectType(projectPath) {
+  // Check if this is a Gradle project
   if (fs.existsSync(path.join(projectPath, 'build.gradle')) ||
       fs.existsSync(path.join(projectPath, 'build.gradle.kts'))) {
     return 'gradle';
   }
+
+  // Check if this is a Maven project
   if (fs.existsSync(path.join(projectPath, 'pom.xml'))) {
     return 'maven';
   }
+
   return 'plain';
+}
+
+// Find the root of a Gradle/Maven project
+function findProjectRoot(projectPath) {
+  let currentPath = projectPath;
+
+  // Look for settings.gradle or settings.gradle.kts (Gradle root)
+  while (currentPath !== path.dirname(currentPath)) {
+    if (fs.existsSync(path.join(currentPath, 'settings.gradle')) ||
+        fs.existsSync(path.join(currentPath, 'settings.gradle.kts'))) {
+      log('info', `Found Gradle root at: ${currentPath}`);
+      return currentPath;
+    }
+
+    // Also check for root pom.xml (Maven root)
+    if (fs.existsSync(path.join(currentPath, 'pom.xml'))) {
+      const pomPath = path.join(currentPath, 'pom.xml');
+      const pomContent = fs.readFileSync(pomPath, 'utf8');
+      if (pomContent.includes('<modules>')) {
+        log('info', `Found Maven root at: ${currentPath}`);
+        return currentPath;
+      }
+    }
+
+    currentPath = path.dirname(currentPath);
+  }
+
+  // No root found, use original path
+  return projectPath;
 }
 
 // Start JDT.LS
@@ -335,7 +368,7 @@ function sendRequest(method, params) {
         responseHandlers.delete(id);
         reject(new Error(`Timeout: ${method}`));
       }
-    }, 30000); // 30 second timeout
+    }, 60000); // 60 second timeout for Gradle projects
   });
 }
 
@@ -394,8 +427,33 @@ async function initializeLSP(projectPath, projectType) {
 
   // Add Gradle-specific settings
   if (projectType === 'gradle') {
-    initOptions.settings.java.import.gradle.home = findGradleHome(projectPath);
-    initOptions.settings.java.import.gradle.version = detectGradleVersion(projectPath);
+    // Use the project's Gradle wrapper if available
+    const hasWrapper = fs.existsSync(path.join(projectPath, 'gradlew'));
+    const gradleVersion = detectGradleVersion(projectPath);
+
+    // Update existing gradle settings (don't create new nested objects)
+    initOptions.settings.java.import.gradle.wrapper.enabled = hasWrapper;
+    initOptions.settings.java.import.gradle.offline.enabled = false;
+
+    // Only set gradle home if not using wrapper
+    if (!hasWrapper) {
+      const gradleHome = findGradleHome(projectPath);
+      if (gradleHome) {
+        initOptions.settings.java.import.gradle.home = gradleHome;
+      }
+    }
+
+    // Set gradle version if detected
+    if (gradleVersion) {
+      initOptions.settings.java.import.gradle.version = gradleVersion;
+    }
+
+    // Add java.home at the root level if needed
+    if (process.env.JAVA_HOME) {
+      initOptions.settings.java.home = process.env.JAVA_HOME;
+    }
+
+    log('info', `Gradle settings: wrapper=${hasWrapper}, version=${gradleVersion}`);
   }
 
   const initResult = await sendRequest('initialize', {
@@ -557,11 +615,37 @@ async function initializeLSP(projectPath, projectType) {
   // CRITICAL: Trigger workspace build for Gradle/Maven projects
   if (projectType === 'gradle' || projectType === 'maven') {
     log('info', 'Triggering workspace build...');
+
+    // For Gradle, try to trigger a full project import
+    if (projectType === 'gradle') {
+      try {
+        // Execute Gradle-specific commands
+        await sendRequest('workspace/executeCommand', {
+          command: 'java.projectConfiguration.update',
+          arguments: [rootUri]
+        });
+        log('info', 'Triggered Gradle project configuration update');
+      } catch (e) {
+        log('warn', 'Could not trigger project configuration update:', e.message);
+      }
+
+      try {
+        // Also try to reload projects
+        await sendRequest('workspace/executeCommand', {
+          command: 'java.reloadProjects'
+        });
+        log('info', 'Triggered project reload');
+      } catch (e) {
+        log('warn', 'Could not trigger project reload:', e.message);
+      }
+    }
+
+    // Trigger workspace build
     try {
       await sendRequest('java/buildWorkspace', true);
       log('info', 'Workspace build triggered');
       // Wait for build to complete
-      await new Promise(resolve => setTimeout(resolve, 10000));
+      await new Promise(resolve => setTimeout(resolve, 15000));
     } catch (e) {
       log('error', 'Failed to trigger workspace build:', e.message);
     }
@@ -701,6 +785,189 @@ function handleToolsList(id) {
         properties: {},
         required: []
       }
+    },
+    {
+      name: 'get_call_hierarchy',
+      description: 'Get method call hierarchy (callers and callees)',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          class_name: {
+            type: 'string',
+            description: 'Fully qualified class name'
+          },
+          method_name: {
+            type: 'string',
+            description: 'Method name'
+          },
+          parameter_types: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Method parameter types (optional)'
+          },
+          include_callers: {
+            type: 'boolean',
+            description: 'Include callers in result',
+            default: true
+          },
+          include_callees: {
+            type: 'boolean',
+            description: 'Include callees in result',
+            default: true
+          }
+        },
+        required: ['class_name', 'method_name']
+      }
+    },
+    {
+      name: 'get_type_hierarchy',
+      description: 'Get class inheritance hierarchy',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          type_name: {
+            type: 'string',
+            description: 'Fully qualified type name'
+          }
+        },
+        required: ['type_name']
+      }
+    },
+    {
+      name: 'find_references',
+      description: 'Find all references to symbols',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          class_name: {
+            type: 'string',
+            description: 'Fully qualified class name'
+          },
+          member_name: {
+            type: 'string',
+            description: 'Member name (method/field, optional)'
+          },
+          parameter_types: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Method parameter types (optional)'
+          },
+          element_type: {
+            type: 'string',
+            description: 'Element type (method/field/type/constructor)',
+            enum: ['method', 'field', 'type', 'constructor']
+          }
+        },
+        required: ['class_name']
+      }
+    },
+    {
+      name: 'get_class_info',
+      description: 'Get detailed information about a class',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          class_name: {
+            type: 'string',
+            description: 'Fully qualified class name'
+          }
+        },
+        required: ['class_name']
+      }
+    },
+    {
+      name: 'get_method_info',
+      description: 'Get detailed information about a method',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          class_name: {
+            type: 'string',
+            description: 'Fully qualified class name'
+          },
+          method_name: {
+            type: 'string',
+            description: 'Method name'
+          },
+          parameter_types: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Method parameter types (optional)'
+          }
+        },
+        required: ['class_name', 'method_name']
+      }
+    },
+    {
+      name: 'refactor_rename',
+      description: 'Rename symbols across the project',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          class_name: {
+            type: 'string',
+            description: 'Fully qualified class name'
+          },
+          old_name: {
+            type: 'string',
+            description: 'Current name'
+          },
+          new_name: {
+            type: 'string',
+            description: 'New name'
+          },
+          element_type: {
+            type: 'string',
+            description: 'Element type (class/method/field)',
+            enum: ['class', 'method', 'field']
+          }
+        },
+        required: ['class_name', 'old_name', 'new_name', 'element_type']
+      }
+    },
+    {
+      name: 'extract_method',
+      description: 'Extract selected code into a new method',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          class_name: {
+            type: 'string',
+            description: 'Fully qualified class name'
+          },
+          start_line: {
+            type: 'integer',
+            description: 'Start line number'
+          },
+          end_line: {
+            type: 'integer',
+            description: 'End line number'
+          },
+          new_method_name: {
+            type: 'string',
+            description: 'Name for the extracted method'
+          }
+        },
+        required: ['class_name', 'start_line', 'end_line', 'new_method_name']
+      }
+    },
+    {
+      name: 'find_usages',
+      description: 'Find all usages of a symbol',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          class_name: {
+            type: 'string',
+            description: 'Fully qualified class name'
+          },
+          member_name: {
+            type: 'string',
+            description: 'Member name (optional)'
+          }
+        },
+        required: ['class_name']
+      }
     }
   ];
 
@@ -730,6 +997,38 @@ async function handleToolCall(id, params) {
         result = await listClasses();
         break;
 
+      case 'get_call_hierarchy':
+        result = await getCallHierarchy(args.class_name, args.method_name, args.parameter_types, args.include_callers, args.include_callees);
+        break;
+
+      case 'get_type_hierarchy':
+        result = await getTypeHierarchy(args.type_name);
+        break;
+
+      case 'find_references':
+        result = await findReferences(args.class_name, args.member_name, args.parameter_types, args.element_type);
+        break;
+
+      case 'get_class_info':
+        result = await getClassInfo(args.class_name);
+        break;
+
+      case 'get_method_info':
+        result = await getMethodInfo(args.class_name, args.method_name, args.parameter_types);
+        break;
+
+      case 'refactor_rename':
+        result = await refactorRename(args.class_name, args.old_name, args.new_name, args.element_type);
+        break;
+
+      case 'extract_method':
+        result = await extractMethod(args.class_name, args.start_line, args.end_line, args.new_method_name);
+        break;
+
+      case 'find_usages':
+        result = await findUsages(args.class_name, args.member_name);
+        break;
+
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
@@ -746,6 +1045,13 @@ async function initializeProject(projectPath) {
 
   if (!fs.existsSync(projectPath)) {
     throw new Error(`Project path does not exist: ${projectPath}`);
+  }
+
+  // Find the actual project root (for multi-module projects)
+  const rootPath = findProjectRoot(projectPath);
+  if (rootPath !== projectPath) {
+    log('info', `Using project root: ${rootPath}`);
+    projectPath = rootPath;
   }
 
   const projectType = detectProjectType(projectPath);
@@ -942,6 +1248,209 @@ function sendMCPToolResult(id, data, isError = false) {
       isError: isError
     }
   }));
+}
+
+// Additional tool implementations for JDT.LS
+
+async function getCallHierarchy(className, methodName, parameterTypes, includeCallers = true, includeCallees = true) {
+  if (!ready) {
+    throw new Error('JDT.LS not initialized. Call initialize_project first.');
+  }
+
+  // Note: Full call hierarchy requires JDT.LS extensions
+  // This is a placeholder implementation
+  return {
+    class: className,
+    method: methodName,
+    callers: includeCallers ? [] : null,
+    callees: includeCallees ? [] : null,
+    message: 'Call hierarchy requires additional JDT.LS protocol extensions'
+  };
+}
+
+async function getTypeHierarchy(typeName) {
+  if (!ready) {
+    throw new Error('JDT.LS not initialized. Call initialize_project first.');
+  }
+
+  // Search for the type first
+  const symbols = await sendRequest('workspace/symbol', { query: typeName });
+
+  if (!symbols || symbols.length === 0) {
+    return {
+      type: typeName,
+      error: 'Type not found'
+    };
+  }
+
+  // Note: Full type hierarchy requires JDT.LS extensions
+  return {
+    type: typeName,
+    superTypes: [],
+    subTypes: [],
+    message: 'Type hierarchy requires additional JDT.LS protocol extensions'
+  };
+}
+
+async function findReferences(className, memberName, parameterTypes, elementType) {
+  if (!ready) {
+    throw new Error('JDT.LS not initialized. Call initialize_project first.');
+  }
+
+  // This is the existing implementation from earlier
+  const query = memberName || className.split('.').pop();
+  const symbols = await sendRequest('workspace/symbol', { query });
+
+  if (!symbols || symbols.length === 0) {
+    return {
+      symbol: `${className}${memberName ? '.' + memberName : ''}`,
+      count: 0,
+      references: [],
+      message: 'Symbol not found'
+    };
+  }
+
+  // Find the best match
+  const target = symbols.find(s =>
+    s.containerName?.includes(className) ||
+    s.name === memberName ||
+    s.name === className.split('.').pop()
+  ) || symbols[0];
+
+  try {
+    const refs = await sendRequest('textDocument/references', {
+      textDocument: { uri: target.location.uri },
+      position: target.location.range.start,
+      context: { includeDeclaration: false }
+    });
+
+    if (!refs || refs.length === 0) {
+      return {
+        symbol: target.name,
+        count: 0,
+        references: []
+      };
+    }
+
+    return {
+      symbol: target.name,
+      count: refs.length,
+      references: refs.slice(0, 50).map(r => ({
+        file: r.uri.replace('file://', ''),
+        line: r.range.start.line + 1,
+        character: r.range.start.character
+      }))
+    };
+  } catch (e) {
+    return {
+      symbol: target.name,
+      error: e.message
+    };
+  }
+}
+
+async function getClassInfo(className) {
+  if (!ready) {
+    throw new Error('JDT.LS not initialized. Call initialize_project first.');
+  }
+
+  const symbols = await sendRequest('workspace/symbol', { query: className });
+
+  if (!symbols || symbols.length === 0) {
+    return {
+      class: className,
+      error: 'Class not found'
+    };
+  }
+
+  const classSymbol = symbols.find(s =>
+    s.kind === 5 && // Class
+    (s.name === className.split('.').pop() || s.containerName?.includes(className))
+  ) || symbols[0];
+
+  return {
+    class: className,
+    name: classSymbol.name,
+    kind: getSymbolKindName(classSymbol.kind),
+    location: classSymbol.location?.uri?.replace('file://', ''),
+    containerName: classSymbol.containerName || ''
+  };
+}
+
+async function getMethodInfo(className, methodName, parameterTypes) {
+  if (!ready) {
+    throw new Error('JDT.LS not initialized. Call initialize_project first.');
+  }
+
+  const symbols = await sendRequest('workspace/symbol', { query: methodName });
+
+  if (!symbols || symbols.length === 0) {
+    return {
+      class: className,
+      method: methodName,
+      error: 'Method not found'
+    };
+  }
+
+  const methodSymbol = symbols.find(s =>
+    s.kind === 6 && // Method
+    s.name === methodName &&
+    s.containerName?.includes(className)
+  );
+
+  if (!methodSymbol) {
+    return {
+      class: className,
+      method: methodName,
+      error: 'Method not found in specified class'
+    };
+  }
+
+  return {
+    class: className,
+    method: methodName,
+    location: methodSymbol.location?.uri?.replace('file://', ''),
+    line: methodSymbol.location?.range?.start?.line + 1
+  };
+}
+
+async function refactorRename(className, oldName, newName, elementType) {
+  if (!ready) {
+    throw new Error('JDT.LS not initialized. Call initialize_project first.');
+  }
+
+  // Note: Rename requires workspace/applyEdit support
+  return {
+    class: className,
+    oldName: oldName,
+    newName: newName,
+    elementType: elementType,
+    message: 'Rename refactoring requires workspace edit capabilities'
+  };
+}
+
+async function extractMethod(className, startLine, endLine, newMethodName) {
+  if (!ready) {
+    throw new Error('JDT.LS not initialized. Call initialize_project first.');
+  }
+
+  // Note: Extract method requires code action support
+  return {
+    class: className,
+    startLine: startLine,
+    endLine: endLine,
+    newMethodName: newMethodName,
+    message: 'Extract method requires code action capabilities'
+  };
+}
+
+async function findUsages(className, memberName) {
+  if (!ready) {
+    throw new Error('JDT.LS not initialized. Call initialize_project first.');
+  }
+
+  // This is similar to find_references
+  return await findReferences(className, memberName, null, null);
 }
 
 function sendMCPError(id, code, message) {
