@@ -147,7 +147,7 @@ async function startJDTLS(projectPath) {
       fs.mkdirSync(WORKSPACE, { recursive: true });
     }
 
-    // JVM arguments
+    // JVM arguments - increased memory for large projects
     const args = [
       '-Declipse.application=org.eclipse.jdt.ls.core.id1',
       '-Dosgi.bundles.defaultStartLevel=4',
@@ -155,8 +155,8 @@ async function startJDTLS(projectPath) {
       '-Dlog.level=' + (DEBUG ? 'ALL' : 'ERROR'),
       '-Dfile.encoding=UTF-8',
       '-DwatchParentProcess=false',
-      '-Xmx2G',
-      '-Xms512M',
+      '-Xmx4G',  // Increased from 2G for large projects
+      '-Xms1G',  // Increased from 512M for faster startup
       '--add-modules=ALL-SYSTEM',
       '--add-opens', 'java.base/java.util=ALL-UNNAMED',
       '--add-opens', 'java.base/java.lang=ALL-UNNAMED',
@@ -238,6 +238,11 @@ function processBuffer() {
     const contentLengthMatch = header.match(/Content-Length:\s*(\d+)/i);
 
     if (!contentLengthMatch) {
+      // Check if this might be a partial header at the start
+      if (buffer.startsWith('Content-Length:') || buffer.startsWith('Co')) {
+        // Wait for more data
+        break;
+      }
       // Invalid header, skip it
       log('warn', 'Invalid LSP header, skipping');
       buffer = buffer.slice(headerEnd + 4);
@@ -254,19 +259,39 @@ function processBuffer() {
       break;
     }
 
-    // Extract the message
-    const messageStr = buffer.slice(messageStart, messageEnd);
+    // Extract the message - be precise about the length
+    const messageStr = buffer.substring(messageStart, messageEnd);
 
-    // Remove processed data from buffer
-    buffer = buffer.slice(messageEnd);
+    // Remove processed data from buffer - be precise
+    buffer = buffer.substring(messageEnd);
 
     // Parse and handle the message
     try {
       const message = JSON.parse(messageStr);
       handleLSPMessage(message);
     } catch (e) {
+      // Check if there's extra data at the end
+      const trimmed = messageStr.trim();
+      try {
+        // Try parsing just the JSON part
+        const jsonEnd = messageStr.lastIndexOf('}');
+        if (jsonEnd > 0) {
+          const jsonOnly = messageStr.substring(0, jsonEnd + 1);
+          const message = JSON.parse(jsonOnly);
+          handleLSPMessage(message);
+          // Put the rest back in the buffer
+          const remainder = messageStr.substring(jsonEnd + 1);
+          if (remainder.length > 0) {
+            buffer = remainder + buffer;
+          }
+          continue;
+        }
+      } catch (e2) {
+        // Still failed
+      }
       log('error', 'Failed to parse LSP message:', e.message);
-      log('error', 'Message was:', messageStr.substring(0, 200));
+      log('error', 'Message was:', messageStr.substring(0, 250));
+      log('debug', 'Full message:', messageStr);
     }
   }
 }
@@ -646,7 +671,8 @@ async function initializeLSP(projectPath, projectType) {
 
   // CRITICAL: Trigger workspace build for Gradle/Maven projects
   if (projectType === 'gradle' || projectType === 'maven') {
-    log('info', 'Triggering workspace build...');
+    log('info', 'Triggering workspace build for ' + projectType + ' project...');
+    log('info', 'Note: Large projects with many dependencies may take 2-3 minutes to index');
 
     // For Gradle, try to trigger a full project import
     if (projectType === 'gradle') {
@@ -674,12 +700,14 @@ async function initializeLSP(projectPath, projectType) {
 
     // Trigger workspace build
     try {
-      await sendRequest('java/buildWorkspace', true);
+      await sendRequest('java/buildWorkspace', true, 90000); // 90 second timeout for build
       log('info', 'Workspace build triggered');
-      // Wait for build to complete
-      await new Promise(resolve => setTimeout(resolve, 15000));
+      // Wait for build to complete - longer for large projects
+      log('info', 'Waiting for initial build to complete (this may download dependencies)...');
+      await new Promise(resolve => setTimeout(resolve, 20000)); // Increased from 15s
     } catch (e) {
       log('error', 'Failed to trigger workspace build:', e.message);
+      // Continue anyway - build might complete in background
     }
   }
 
@@ -689,7 +717,7 @@ async function initializeLSP(projectPath, projectType) {
 }
 
 // Wait for workspace to be ready by checking if we can query symbols
-async function waitForWorkspaceReady(projectPath, maxWaitTime = 120000) {
+async function waitForWorkspaceReady(projectPath, maxWaitTime = 180000) {  // Increased to 3 minutes for large projects
   const startTime = Date.now();
   const checkInterval = 5000; // Check every 5 seconds
 
@@ -721,7 +749,7 @@ async function waitForWorkspaceReady(projectPath, maxWaitTime = 120000) {
 
     // Show progress
     const elapsed = Math.round((Date.now() - startTime) / 1000);
-    log('info', `Waiting for workspace indexing... ${elapsed}s elapsed`);
+    log('info', `Waiting for workspace indexing... ${elapsed}s elapsed (may take 2-3 minutes for large projects)`);
   }
 
   log('error', 'Workspace failed to become ready within timeout period');
