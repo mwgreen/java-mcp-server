@@ -331,4 +331,19 @@ public class BasicModeAnalyzer {
     public List<String> getAllClasses() {
         return new ArrayList<>(sourceFiles.keySet());
     }
+
+    public int getFileCount() {
+        return astCache.size();
+    }
+
+    public Set<String> getAllPackages() {
+        Set<String> packages = new HashSet<>();
+        for (String className : sourceFiles.keySet()) {
+            int lastDot = className.lastIndexOf('.');
+            if (lastDot > 0) {
+                packages.add(className.substring(0, lastDot));
+            }
+        }
+        return packages;
+    }
 }

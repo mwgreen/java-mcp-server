@@ -39,78 +39,12 @@ public class JavaMCPServer {
     }
     
     public static void main(String[] args) {
-        // Skip Eclipse initialization for faster startup
-        // Will be initialized on demand when needed
-        
+        // Eclipse workspace will be initialized on demand through EclipseWorkspaceManager
         JavaMCPServer server = new JavaMCPServer();
         server.run();
     }
     
-    private static boolean eclipseWorkspaceInitialized = false;
-    
-    public static synchronized void ensureEclipseWorkspace() {
-        if (!eclipseWorkspaceInitialized) {
-            initializeEclipseWorkspace();
-            eclipseWorkspaceInitialized = true;
-        }
-    }
-    
-    private static void initializeEclipseWorkspace() {
-        // Initialize Eclipse workspace for headless operation
-        try {
-            // Create workspace directory
-            Path workspaceDir = createTemporaryWorkspace();
-            
-            // Set system properties for headless Eclipse
-            System.setProperty("osgi.instance.area", workspaceDir.toUri().toString());
-            System.setProperty("osgi.configuration.area", workspaceDir.resolve("configuration").toUri().toString());
-            System.setProperty("eclipse.application", "org.eclipse.jdt.apt.core.aptBuild");
-            System.setProperty("eclipse.ignoreApp", "true");
-            System.setProperty("osgi.noShutdown", "true");
-            System.setProperty("eclipse.application.launchDefault", "false");
-            
-            logger.info("Set up Eclipse headless workspace at: {}", workspaceDir);
-            
-            // Note: Full OSGi runtime requires Eclipse installation
-            // For now, we'll work with limited JDT functionality
-            logger.info("Running with limited Eclipse JDT functionality (no full OSGi runtime)");
-            
-        } catch (Exception e) {
-            logger.error("Failed to set up Eclipse environment: {}", e.getMessage());
-            // Don't throw - continue with basic mode
-        }
-    }
-    
-    private static Path createTemporaryWorkspace() throws IOException {
-        Path tempDir = Files.createTempDirectory("eclipse-workspace-");
-        Files.createDirectories(tempDir.resolve("configuration"));
-        
-        // Add shutdown hook to clean up
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            try {
-                deleteDirectory(tempDir);
-                logger.debug("Cleaned up temporary workspace: {}", tempDir);
-            } catch (Exception e) {
-                logger.warn("Failed to clean up temporary workspace: {}", e.getMessage());
-            }
-        }));
-        
-        return tempDir;
-    }
-    
-    private static void deleteDirectory(Path directory) throws IOException {
-        if (Files.exists(directory)) {
-            Files.walk(directory)
-                    .sorted((a, b) -> b.compareTo(a)) // Delete files before directories
-                    .forEach(path -> {
-                        try {
-                            Files.delete(path);
-                        } catch (IOException e) {
-                            logger.debug("Could not delete {}: {}", path, e.getMessage());
-                        }
-                    });
-        }
-    }
+    // Eclipse workspace initialization is now handled by EclipseWorkspaceManager
     
     public void run() {
         // Log session ID if provided
@@ -481,10 +415,25 @@ public class JavaMCPServer {
         if (!checkInitialized(id)) {
             return createErrorResponse(id, "not_initialized", "Project not initialized");
         }
-        
+
         String typeName = arguments.path("type_name").asText();
+
+        // Check if we're in basic mode
+        if (projectAnalyzer.isBasicMode()) {
+            Map<String, Object> result = new HashMap<>();
+            result.put("error", "Type hierarchy analysis not available in basic mode. Full Eclipse workspace required.");
+            result.put("type", typeName);
+            result.put("mode", "basic");
+            return createSuccessResponse(id, objectMapper.valueToTree(result));
+        }
+
+        if (typeHierarchyAnalyzer == null) {
+            Map<String, Object> result = new HashMap<>();
+            result.put("error", "Type hierarchy analyzer not initialized");
+            return createSuccessResponse(id, objectMapper.valueToTree(result));
+        }
+
         Map<String, Object> hierarchy = typeHierarchyAnalyzer.getCompleteHierarchy(typeName);
-        
         return createSuccessResponse(id, objectMapper.valueToTree(hierarchy));
     }
     
@@ -492,7 +441,21 @@ public class JavaMCPServer {
         if (!checkInitialized(id)) {
             return createErrorResponse(id, "not_initialized", "Project not initialized");
         }
-        
+
+        // Check if we're in basic mode
+        if (projectAnalyzer.isBasicMode()) {
+            Map<String, Object> result = new HashMap<>();
+            result.put("error", "Reference finding not available in basic mode. Full Eclipse workspace required.");
+            result.put("mode", "basic");
+            return createSuccessResponse(id, objectMapper.valueToTree(result));
+        }
+
+        if (referencesFinder == null) {
+            Map<String, Object> result = new HashMap<>();
+            result.put("error", "References finder not initialized");
+            return createSuccessResponse(id, objectMapper.valueToTree(result));
+        }
+
         String className = arguments.path("class_name").asText();
         String memberName = arguments.path("member_name").asText();
         String[] paramTypes = getStringArray(arguments.path("parameter_types"));
@@ -581,7 +544,21 @@ public class JavaMCPServer {
         if (!checkInitialized(id)) {
             return createErrorResponse(id, "not_initialized", "Project not initialized");
         }
-        
+
+        // Check if we're in basic mode
+        if (projectAnalyzer.isBasicMode()) {
+            Map<String, Object> result = new HashMap<>();
+            result.put("error", "Refactoring not available in basic mode. Full Eclipse workspace required.");
+            result.put("mode", "basic");
+            return createSuccessResponse(id, objectMapper.valueToTree(result));
+        }
+
+        if (refactoringEngine == null) {
+            Map<String, Object> result = new HashMap<>();
+            result.put("error", "Refactoring engine not initialized");
+            return createSuccessResponse(id, objectMapper.valueToTree(result));
+        }
+
         String elementType = arguments.path("element_type").asText();
         String className = arguments.path("class_name").asText();
         String memberName = arguments.path("member_name").asText();

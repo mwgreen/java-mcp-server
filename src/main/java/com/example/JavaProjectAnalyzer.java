@@ -50,37 +50,32 @@ public class JavaProjectAnalyzer {
         
         this.projectName = path.getFileName().toString();
         
-        // Try to initialize Eclipse workspace if not already done
+        // Try to initialize Eclipse platform with full OSGi support
         if (!workspaceAvailable) {
             try {
-                logger.info("Attempting to initialize Eclipse workspace...");
-                // Initialize Eclipse workspace on first use
-                if (workspaceRoot == null) {
-                    // This will trigger Eclipse workspace initialization in JavaMCPServer
-                    JavaMCPServer.ensureEclipseWorkspace();
-                    
-                    // Try to get workspace root - may fail if OSGi isn't fully initialized
-                    try {
-                        IWorkspace workspace = ResourcesPlugin.getWorkspace();
-                        if (workspace != null) {
-                            workspaceRoot = workspace.getRoot();
-                            workspaceAvailable = true;
-                            logger.info("Eclipse workspace is now available");
-                        } else {
-                            logger.warn("Workspace is null, will use basic mode");
-                            workspaceAvailable = false;
-                        }
-                    } catch (Exception wsEx) {
-                        logger.warn("Could not access Eclipse workspace: {}", wsEx.getMessage());
+                logger.info("Attempting to initialize Eclipse platform with full OSGi support...");
+
+                EclipsePlatformStarter platform = EclipsePlatformStarter.getInstance();
+                if (platform.initialize()) {
+                    org.eclipse.core.resources.IWorkspace workspace = platform.getWorkspace();
+                    if (workspace != null) {
+                        workspaceRoot = workspace.getRoot();
+                        workspaceAvailable = true;
+                        logger.info("Eclipse platform successfully initialized with full JDT support!");
+                    } else {
+                        logger.warn("Eclipse platform started but workspace is null");
                         workspaceAvailable = false;
                     }
+                } else {
+                    logger.warn("Eclipse platform initialization failed, will use basic mode");
+                    workspaceAvailable = false;
                 }
             } catch (Exception e) {
-                logger.warn("Could not initialize Eclipse environment: {}", e.getMessage());
+                logger.warn("Could not initialize Eclipse platform: {}", e.getMessage());
                 workspaceAvailable = false;
             }
         }
-        
+
         if (workspaceAvailable) {
             try {
                 initializeWithWorkspace(path, projectDir);
@@ -98,33 +93,13 @@ public class JavaProjectAnalyzer {
     }
     
     private void initializeWithWorkspace(java.nio.file.Path path, File projectDir) throws CoreException {
-        // Create Eclipse project
-        IProject project = workspaceRoot.getProject(projectName);
-        
-        if (!project.exists()) {
-            IProjectDescription description = ResourcesPlugin.getWorkspace().newProjectDescription(projectName);
-            description.setLocation(new Path(path.toString()));
-            project.create(description, null);
-            logger.debug("Created Eclipse project: {}", projectName);
-        }
-        
-        if (!project.isOpen()) {
-            project.open(null);
-            logger.debug("Opened Eclipse project: {}", projectName);
-        }
-        
-        // Add Java nature if not present
-        if (!project.hasNature(JavaCore.NATURE_ID)) {
-            addJavaNature(project);
-            logger.debug("Added Java nature to project: {}", projectName);
-        }
-        
-        // Create Java project
-        this.javaProject = JavaCore.create(project);
-        
-        // Configure classpath
-        configureClasspath(projectDir);
-        logger.debug("Configured classpath for project: {}", projectName);
+        logger.info("Initializing project with Eclipse workspace: {}", projectName);
+
+        // Use the platform starter to create a properly configured Java project
+        EclipsePlatformStarter platform = EclipsePlatformStarter.getInstance();
+        this.javaProject = platform.createJavaProject(projectName, projectPath);
+
+        logger.info("Java project created with full Eclipse JDT support");
     }
     
     private void initializeBasicMode(File projectDir) {
@@ -313,7 +288,7 @@ public class JavaProjectAnalyzer {
         info.put("location", projectPath);
         
         if (workspaceAvailable && javaProject != null) {
-            info.put("mode", "full_eclipse_workspace");
+            info.put("mode", "eclipse_workspace");
             
             try {
                 // Count types
@@ -340,9 +315,30 @@ public class JavaProjectAnalyzer {
             }
         } else {
             info.put("mode", "basic_file_analysis");
-            info.put("totalTypes", 0);
-            info.put("totalPackages", 0);
-            info.put("totalCompilationUnits", 0);
+
+            // Get statistics from basic analyzer
+            if (basicAnalyzer != null) {
+                List<String> allClasses = basicAnalyzer.getAllClasses();
+                info.put("totalTypes", allClasses.size());
+
+                // Count unique packages
+                Set<String> packages = new HashSet<>();
+                for (String className : allClasses) {
+                    int lastDot = className.lastIndexOf('.');
+                    if (lastDot > 0) {
+                        packages.add(className.substring(0, lastDot));
+                    }
+                }
+                info.put("totalPackages", packages.size());
+
+                // In basic mode, we count Java files as compilation units
+                info.put("totalCompilationUnits", allClasses.size()); // Approximate
+            } else {
+                info.put("totalTypes", 0);
+                info.put("totalPackages", 0);
+                info.put("totalCompilationUnits", 0);
+            }
+
             info.put("note", "Running in basic mode. Full Eclipse workspace not available.");
         }
         
